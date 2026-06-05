@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 def get_gpu_processes():
     """获取当前用户的GPU训练进程"""
     try:
-        user = os.getenv('USER', 'weimingzhi')
+        user = os.getenv('USER') or os.getenv('LOGNAME') or subprocess.run(['whoami'], capture_output=True, text=True).stdout.strip()
         result = subprocess.run(
             ['ps', '-u', user, '-o', 'pid,ppid,stat,args'],
             capture_output=True, text=True
