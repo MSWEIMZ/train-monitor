@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""训练监控：自动发现GPU上的训练进程，显示epoch/loss/acc状态"""
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+
+def get_gpu_processes():
+    """获取当前用户的GPU训练进程"""
+    try:
+        user = os.getenv('USER', 'weimingzhi')
+        result = subprocess.run(
+            ['ps', '-u', user, '-o', 'pid,ppid,stat,args'],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return []
+
+        processes = []
+        seen_pids = set()
+
+        # 第一遍：找bash nohup进程（包含CUDA_VISIBLE_DEVICES和train）
+        bash_train_processes = {}
+        for line in result.stdout.split('\n'):
+            if 'CUDA_VISIBLE_DEVICES' in line and ('train' in line or 'epoch' in line):
+                parts = line.split(None, 3)
+                if len(parts) >= 4:
+                    pid, ppid, stat, cmdline = parts[0], parts[1], parts[2], parts[3]
+                    # 提取CUDA_VISIBLE_DEVICES
+                    cuda_match = re.search(r'CUDA_VISIBLE_DEVICES[= ](\d+)', cmdline)
+                    if cuda_match:
+                        bash_train_processes[pid] = cuda_match.group(1)
+
+        # 第二遍：找python训练进程
+        for line in result.stdout.split('\n'):
+            if not re.search(r'^\s*\d+\s+\d+\s+\S+\s+python', line):
+                continue
+
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+
+            pid, ppid, stat, cmdline = parts[0], parts[1], parts[2], parts[3]
+
+            # 只看正在运行的进程（R=运行，S=睡眠等待）
+            if stat[0] not in ('R', 'S'):
+                continue
+
+            # 跳过mcp、minimax等非训练进程
+            if any(x in cmdline.lower() for x in ['mcp', 'minimax', 'cache', 'uv']):
+                continue
+
+            # 必须包含train相关关键词
+            if not any(x in cmdline.lower() for x in ['train', 'epoch', 'fold']):
+                continue
+
+            # 提取GPU信息
+            gpu_id = '?'
+            cuda_match = re.search(r'CUDA_VISIBLE_DEVICES[= ](\d+)', cmdline)
+            device_match = re.search(r'--device[= ](cuda:\d+)', cmdline)
+
+            if cuda_match:
+                gpu_id = cuda_match.group(1)
+            elif device_match:
+                gpu_id = device_match.group(1).replace('cuda:', '')
+            elif ppid in bash_train_processes:
+                # 如果父进程是bash train进程，继承其CUDA_VISIBLE_DEVICES
+                gpu_id = bash_train_processes[ppid]
+
+            # 只显示主进程（有GPU信息的）
+            if gpu_id == '?':
+                # 检查是否是train_*.py脚本
+                if not re.search(r'train_\w+\.py', cmdline):
+                    continue
+
+            # 提取实验名
+            exp_name = extract_exp_name(cmdline)
+
+            # 获取日志路径
+            log_path = get_log_path(pid)
+
+            processes.append({
+                'pid': pid,
+                'gpu': f"cuda:{gpu_id}" if gpu_id != '?' else '?',
+                'exp_name': exp_name,
+                'log_path': log_path,
+                'cmdline': cmdline
+            })
+
+        return processes
+    except Exception as e:
+        return []
+
+def extract_exp_name(cmdline):
+    """从命令行提取实验名"""
+    # 提取脚本名
+    match = re.search(r'(?:python\S*?|python3)\s+(\S+\.py)', cmdline)
+    if match:
+        script = Path(match.group(1)).stem
+        # 简化名称
+        script = script.replace('train_', '').replace('train', 'train')
+        return script
+
+    # 尝试提取--name参数
+    match = re.search(r'--name[= ](\S+)', cmdline)
+    if match:
+        return match.group(1)
+
+    return 'unknown'
+
+def get_log_path(pid):
+    """获取进程的日志文件路径"""
+    try:
+        # 尝试从stdout获取
+        log_path = os.readlink(f'/proc/{pid}/fd/1')
+        if not log_path.startswith('/dev/'):
+            return log_path
+
+        # 尝试从stderr获取
+        log_path = os.readlink(f'/proc/{pid}/fd/2')
+        if not log_path.startswith('/dev/'):
+            return log_path
+
+        return None
+    except:
+        return None
+
+def extract_description(lines):
+    """从日志开头提取实验描述"""
+    # 在===之间找描述
+    in_block = False
+    desc_lines = []
+    for line in lines:
+        line = line.strip()
+        if '=====' in line:
+            if in_block:
+                break
+            in_block = True
+            continue
+        if in_block and line and not line.startswith('Changes') and not line.startswith('-'):
+            desc_lines.append(line)
+            # 只取第一行有意义的描述
+            if len(desc_lines) >= 1:
+                break
+
+    if desc_lines:
+        return desc_lines[0][:50]  # 最多50字符
+
+    # 如果没有===块，找Training开头的行
+    for line in lines:
+        line = line.strip()
+        if line.startswith('Training'):
+            return line[:50]
+
+    return None
+
+def parse_training_log(log_path):
+    """解析训练日志，提取最新epoch信息和实验描述"""
+    if not log_path or not os.path.exists(log_path):
+        return None
+
+    try:
+        # 读取最后100行
+        with open(log_path, 'r', errors='ignore') as f:
+            lines = f.readlines()
+            last_lines = lines[-100:] if len(lines) > 100 else lines
+
+        # 提取实验描述（从开头几行）
+        desc = extract_description(lines[:30])
+
+        # 解析epoch信息 - 支持多种格式
+        epoch_info = None
+
+        for line in reversed(last_lines):
+            line = line.strip()
+
+            # 格式1: Epoch 12/50 | Train 0.6348 0.9998 | Val 0.8152 0.8008 0.7750
+            match = re.search(r'Epoch\s+(\d+)/(\d+).*?Val\s+[\d.]+\s+([\d.]+)\s+([\d.]+)', line)
+            if match:
+                return {
+                    'current': int(match.group(1)),
+                    'total': int(match.group(2)),
+                    'val_acc': float(match.group(3)),
+                    'val_mf1': float(match.group(4)),
+                    'trend': '↑' if '★' in line else '→',
+                    'desc': desc
+                }
+
+            # 格式2: Ep 001 [LR: 1.15e-05] | Train Loss 2.795 Acc 0.061 | Val Loss 2.648 Acc 0.158 | MF1 0.077
+            match = re.search(r'Ep\s+(\d+).*?Val Loss\s+[\d.]+\s+Acc\s+([\d.]+).*?MF1\s+([\d.]+)', line)
+            if match:
+                return {
+                    'current': int(match.group(1)),
+                    'total': None,
+                    'val_acc': float(match.group(2)),
+                    'val_mf1': float(match.group(3)),
+                    'trend': '↑' if '★' in line else '→',
+                    'desc': desc
+                }
+
+            # 格式3: Epoch 12 | val_loss=0.112
+            match = re.search(r'Epoch\s+(\d+).*?val_loss[=:]\s*([\d.]+)', line)
+            if match:
+                return {
+                    'current': int(match.group(1)),
+                    'total': None,
+                    'val_acc': None,
+                    'val_mf1': None,
+                    'val_loss': float(match.group(2)),
+                    'trend': '↓',
+                    'desc': desc
+                }
+
+            # 格式4: Epoch 39/50 | Train 0.1291 | Val 0.1033 (蒸馏loss)
+            match = re.search(r'Epoch\s+(\d+)/(\d+).*?Val\s+([\d.]+)', line)
+            if match:
+                return {
+                    'current': int(match.group(1)),
+                    'total': int(match.group(2)),
+                    'val_acc': None,
+                    'val_mf1': None,
+                    'val_loss': float(match.group(3)),
+                    'trend': '↑' if '★' in line else '→',
+                    'desc': desc
+                }
+
+        return None
+
+    except Exception as e:
+        return None
+
+def main():
+    """主函数"""
+    # 获取GPU进程
+    gpu_processes = get_gpu_processes()
+
+    if not gpu_processes:
+        print("没有发现正在运行的训练进程")
+        return
+
+    # 去重：同一日志文件只显示一次
+    seen_logs = set()
+    unique_processes = []
+    for p in gpu_processes:
+        log_key = p['log_path'] or p['pid']
+        if log_key not in seen_logs:
+            seen_logs.add(log_key)
+            unique_processes.append(p)
+
+    # 输出表格（北京时间）
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz).strftime('%Y-%m-%d %H:%M:%S')
+    print(f"══════════════════════════════════════════════════════════════════════════════")
+    print(f"  train_monitor   {now}")
+    print(f"══════════════════════════════════════════════════════════════════════════════")
+    print()
+    print(f"  {'Experiment':<20} {'GPU':<8} {'Epoch':<10} {'Val Acc':<10} {'Val MF1':<10} {'Description':<30}")
+    print(f"  {'─'*20} {'─'*8} {'─'*10} {'─'*10} {'─'*10} {'─'*30}")
+
+    for t in unique_processes:
+        exp_name = t['exp_name'][:20]
+        gpu = t['gpu']
+
+        if t['log_path']:
+            info = parse_training_log(t['log_path'])
+            if info:
+                epoch = f"{info['current']}/{info['total']}" if info.get('total') else str(info.get('current', '?'))
+                # 优先显示acc，没有则显示loss
+                if info.get('val_acc'):
+                    val_acc = f"{info['val_acc']*100:.1f}%"
+                elif info.get('val_loss'):
+                    val_acc = f"loss:{info['val_loss']:.3f}"
+                else:
+                    val_acc = '-'
+                val_mf1 = f"{info['val_mf1']*100:.1f}%" if info.get('val_mf1') else '-'
+                desc = info.get('desc', '-') or '-'
+            else:
+                epoch = '?'
+                val_acc = '-'
+                val_mf1 = '-'
+                desc = '-'
+        else:
+            epoch = '?'
+            val_acc = '-'
+            val_mf1 = '-'
+            desc = '-'
+
+        print(f"  {exp_name:<20} {gpu:<8} {epoch:<10} {val_acc:<10} {val_mf1:<10} {desc:<30}")
+
+    print()
+
+if __name__ == '__main__':
+    main()
