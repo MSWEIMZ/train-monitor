@@ -38,15 +38,41 @@ trainbot                # 同tm
 # 配置
 trainbot --setup        # 交互式配置
 trainbot --config       # 查看当前配置
+trainbot --test         # 测试配置（增强版）
 
 # 通知
 trainbot --notify       # 手动发一次通知
-trainbot --test         # 测试webhook连接
+trainbot --notify-all   # 发送所有训练状态
 
 # 监控（后台运行）
 trainbot --daemon       # 启动后台监控
 trainbot --stop         # 停止后台监控
+trainbot --stop-all     # 停止所有监控
 trainbot --status       # 查看后台监控状态
+
+# 通知历史
+trainbot --history      # 查看最近10条通知
+trainbot --history --all    # 查看全部
+trainbot --history --clear  # 清空历史
+
+# 更新与维护
+trainbot --check-update # 检查更新
+trainbot --update       # 更新到最新版本
+trainbot --uninstall    # 卸载
+
+# 配置迁移
+trainbot --export       # 导出配置
+trainbot --import FILE  # 导入配置
+
+# 日志
+trainbot --log          # 查看trainbot日志
+trainbot --log --tail N # 查看最后N行
+trainbot --log --clear  # 清空日志
+
+# 批量操作
+trainbot --set-webhook URL  # 设置webhook
+trainbot --set-alert BOOL   # 开启/关闭异常检测
+trainbot --set-interval N   # 设置定时汇报间隔
 ```
 
 ### 2.3 通知触发条件
@@ -117,14 +143,30 @@ trainbot/
   "alert_thresholds": {
     "loss_spike": 2.0,
     "acc_drop": 0.2,
-    "check_nan": true
+    "check_nan": true,
+    "stuck_minutes": 30,
+    "check_oom": true,
+    "check_crash": true
   },
   "monitor": {
     "mode": "auto",
     "log_dir": null,
     "custom_patterns": null,
-    "tensorboard_dir": null
-  }
+    "tensorboard_dir": null,
+    "proc_root": "/proc"
+  },
+  "webhooks": {
+    "default": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
+    "alerts": null,
+    "reports": null
+  },
+  "notify_rules": {
+    "complete": "default",
+    "alert": "default",
+    "report": "default"
+  },
+  "auto_check_update": true,
+  "update_channel": "stable"
 }
 ```
 
@@ -483,6 +525,123 @@ GPU 3: fusion      Epoch 15/50  Acc 85.6%
 - 失败后尝试Latin-1
 - 最后使用errors='ignore'
 
+### 8.6 训练失败检测
+
+**场景：** 训练进程崩溃、OOM（GPU内存不足）
+
+**检测方式：**
+```python
+# 进程崩溃检测
+if pid not in running_pids:
+    notify("训练进程异常退出", pid)
+
+# OOM检测（通过nvidia-smi）
+if "CUDA out of memory" in log_tail:
+    notify("GPU内存不足(OOM)", pid)
+
+# dmesg检测OOM killer
+if "Out of memory" in subprocess.run(["dmesg"]).stdout:
+    notify("系统OOM Killer终止了训练", pid)
+```
+
+**通知示例：**
+```
+══════════════════════════════
+⚠️ 训练异常告警
+══════════════════════════════
+实验: resnet18
+GPU: cuda:0
+状态: 进程异常退出
+最后Epoch: 32/50
+最后Val Acc: 85.3%
+退出码: 137 (OOM Killer)
+```
+
+### 8.7 训练卡住检测
+
+**场景：** 训练长时间没有新输出（死循环、挂起）
+
+**检测方式：**
+```python
+# 记录最后输出时间
+last_output_time = get_last_log_time(log_path)
+
+# 超过阈值没有新输出
+if time.time() - last_output_time > stuck_threshold:
+    notify("训练疑似卡住", pid)
+```
+
+**配置：**
+```json
+{
+  "alert_thresholds": {
+    "stuck_minutes": 30  // 30分钟没有新输出视为卡住
+  }
+}
+```
+
+### 8.8 多Webhook支持
+
+**场景：** 不同通知发到不同钉钉群
+
+**配置：**
+```json
+{
+  "webhooks": {
+    "default": "https://oapi.dingtalk.com/robot/send?access_token=xxx",
+    "alerts": "https://oapi.dingtalk.com/robot/send?access_token=yyy",
+    "reports": "https://oapi.dingtalk.com/robot/send?access_token=zzz"
+  },
+  "notify_rules": {
+    "complete": "default",
+    "alert": "alerts",
+    "report": "reports"
+  }
+}
+```
+
+**简化配置（向后兼容）：**
+```json
+{
+  "webhook": "https://oapi.dingtalk.com/robot/send?access_token=xxx"
+}
+// 等同于
+{
+  "webhooks": {"default": "..."},
+  "notify_rules": {"complete": "default", "alert": "default", "report": "default"}
+}
+```
+
+### 8.9 通知历史
+
+**场景：** 查看历史通知记录
+
+**存储位置：** `~/.trainbot/history.json`
+
+**记录格式：**
+```json
+{
+  "notifications": [
+    {
+      "time": "2026-06-05T10:30:00",
+      "type": "complete",
+      "experiment": "resnet18",
+      "gpu": "cuda:0",
+      "epoch": "50/50",
+      "val_acc": "92.3%",
+      "webhook": "default"
+    }
+  ]
+}
+```
+
+**查看命令：**
+```bash
+trainbot --history          # 查看最近10条
+trainbot --history --all    # 查看全部
+trainbot --history --clear  # 清空历史
+```
+
 ## 9. 兼容性
 
 ### 9.1 Python版本
@@ -565,16 +724,254 @@ $ trainbot
 ╚══════════════════════════════════════════════════════════════╝
 ```
 
-**配置验证：**
+**配置验证（增强版）：**
 ```bash
 $ trainbot --test
-✓ 配置文件存在
-✓ webhook格式正确
-✓ webhook连接成功
-✓ 发送测试消息成功
-
-测试消息已发送到钉钉群，请检查是否收到。
+╔══════════════════════════════════════════════════════════════╗
+║                    配置验证报告                              ║
+╠══════════════════════════════════════════════════════════════╣
+║  ✓ 配置文件存在: ~/.trainbot/config.json                     ║
+║  ✓ 配置格式正确                                              ║
+║  ✓ webhook格式正确                                           ║
+║  ✓ webhook连接成功                                           ║
+║  ✓ 发送测试消息成功                                          ║
+║  ✓ 通知历史可写                                              ║
+║  ✓ 监控模式: auto                                            ║
+║  ✓ 异常检测: 已开启                                          ║
+║  ✓ 定时汇报: 已关闭                                          ║
+╠══════════════════════════════════════════════════════════════╣
+║  测试消息已发送到钉钉群，请检查是否收到。                    ║
+╚══════════════════════════════════════════════════════════════╝
 ```
+
+## 11. 更新与维护
+
+### 11.1 更新机制
+
+**检查更新：**
+```bash
+trainbot --check-update
+# 当前版本: v0.1.0
+# 最新版本: v0.2.0
+# 运行 trainbot --update 进行更新
+```
+
+**自动更新：**
+```bash
+trainbot --update
+# 下载最新版本...
+# 备份当前版本: ~/.trainbot/backup/trainbot_v0.1.0
+# 更新完成！
+```
+
+**更新配置（可选）：**
+```json
+{
+  "auto_check_update": true,  // 自动检查更新
+  "update_channel": "stable"  // stable/beta
+}
+```
+
+### 11.2 卸载机制
+
+**完全卸载：**
+```bash
+trainbot --uninstall
+# 确认卸载 trainbot? (y/n): y
+# 停止后台监控...
+# 删除程序文件: ~/.local/bin/trainbot
+# 删除配置目录: ~/.trainbot/ (可选)
+# 卸载完成！
+
+# 保留配置（用于重装）
+trainbot --uninstall --keep-config
+```
+
+**手动卸载：**
+```bash
+# 1. 停止后台监控
+trainbot --stop
+
+# 2. 删除程序文件
+rm ~/.local/bin/trainbot
+
+# 3. 删除配置（可选）
+rm -rf ~/.trainbot/
+
+# 4. 删除别名（如果添加了）
+# 编辑 ~/.bashrc，删除 alias tm="trainbot"
+```
+
+### 11.3 配置迁移
+
+**导出配置：**
+```bash
+trainbot --export > trainbot_config.json
+# 或指定路径
+trainbot --export --output /path/to/config.json
+```
+
+**导入配置：**
+```bash
+trainbot --import trainbot_config.json
+# 配置已导入！
+```
+
+**迁移步骤：**
+```bash
+# 在旧机器
+trainbot --export > trainbot_config.json
+
+# 复制到新机器
+scp trainbot_config.json new_machine:~/
+
+# 在新机器
+wget https://raw.githubusercontent.com/MSWEIMZ/trainbot/main/trainbot -O ~/.local/bin/trainbot
+chmod +x ~/.local/bin/trainbot
+trainbot --import ~/trainbot_config.json
+trainbot --test
+```
+
+### 11.4 日志查看
+
+**trainbot自身日志：**
+```bash
+trainbot --log              # 查看最近日志
+trainbot --log --tail 100   # 查看最后100行
+trainbot --log --clear      # 清空日志
+```
+
+**日志位置：** `~/.trainbot/trainbot.log`
+
+**日志格式：**
+```
+[2026-06-05 10:30:00] INFO: 发现训练进程 PID=12345 GPU=cuda:0
+[2026-06-05 10:30:01] INFO: 解析日志成功 Epoch=32/50 Acc=85.3%
+[2026-06-05 10:31:00] INFO: 发送通知成功 type=report
+[2026-06-05 10:35:00] WARN: 训练进程 PID=12345 超过30分钟无输出
+[2026-06-05 10:36:00] ERROR: webhook调用失败，重试中 (1/3)
+```
+
+## 12. 环境支持
+
+### 12.1 Python虚拟环境
+
+**检测方式：**
+```python
+# 检测当前Python环境
+if hasattr(sys, 'real_prefix') or (hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix):
+    env_type = "virtualenv"
+elif 'CONDA_DEFAULT_ENV' in os.environ:
+    env_type = "conda"
+else:
+    env_type = "system"
+```
+
+**使用建议：**
+```bash
+# 推荐：使用系统Python
+/usr/bin/python3 ~/.local/bin/trainbot
+
+# 或在虚拟环境中安装
+pip install trainbot  # 未来支持
+```
+
+### 12.2 Conda环境
+
+**配置方式：**
+```bash
+# 方式1：使用当前conda环境
+conda activate myenv
+trainbot --setup
+
+# 方式2：指定conda环境
+trainbot --setup --python /path/to/conda/envs/myenv/bin/python
+```
+
+**注意事项：**
+- trainbot会自动检测当前环境
+- 如果conda环境没有Python，会提示错误
+- 建议在base环境中安装trainbot
+
+### 12.3 Docker容器
+
+**场景：** 训练在Docker容器中运行
+
+**支持方式：**
+```bash
+# 方式1：在容器内运行trainbot
+docker exec -it my_container trainbot --setup
+
+# 方式2：从宿主机监控容器（需要挂载/proc）
+docker run -v /proc:/host/proc:ro my_train_image
+trainbot --setup --proc-root /host/proc
+```
+
+**配置：**
+```json
+{
+  "monitor": {
+    "proc_root": "/proc",  // 或 "/host/proc" 用于Docker
+    "container_mode": false
+  }
+}
+```
+
+### 12.4 远程服务器
+
+**场景：** 训练在远程服务器上运行
+
+**支持方式：**
+```bash
+# 方式1：SSH隧道
+ssh -L 8080:localhost:8080 remote_server
+trainbot --web http://localhost:8080
+
+# 方式2：远程执行
+ssh remote_server "trainbot --notify"
+
+# 方式3：共享配置
+scp ~/.trainbot/config.json remote_server:~/.trainbot/
+```
+
+## 13. 批量操作
+
+### 13.1 批量停止
+
+**停止所有监控：**
+```bash
+trainbot --stop-all
+# 停止 trainbot daemon (PID: 12345)
+# 停止 trainbot daemon (PID: 12346)
+# 已停止 2 个监控进程
+```
+
+### 13.2 批量通知
+
+**手动发送所有状态：**
+```bash
+trainbot --notify-all
+# 发送 cuda:0 状态...
+# 发送 cuda:1 状态...
+# 发送 cuda:2 状态...
+# 已发送 3 条通知
+```
+
+### 13.3 批量配置
+
+**批量修改配置：**
+```bash
+# 修改所有webhook
+trainbot --set-webhook https://new-webhook-url
+
+# 开启所有异常检测
+trainbot --set-alert true
+
+# 设置定时汇报
+trainbot --set-interval 2
+```
+
+## 14. 风险与挑战
 
 ## 11. 风险与挑战
 
