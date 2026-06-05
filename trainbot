@@ -639,6 +639,348 @@ def parse_custom_log(log_path, patterns):
         return None
 
 
+# === DingTalk Notification ===
+
+
+def format_notification(info, notify_type="complete", fmt="detailed"):
+    """格式化通知消息"""
+    type_labels = {
+        "complete": "训练完成通知",
+        "alert": "⚠️ 训练异常告警",
+        "report": "训练状态汇报"
+    }
+    title = type_labels.get(notify_type, "训练通知")
+    lines = [
+        "══════════════════════════════",
+        title,
+        "══════════════════════════════",
+        f"实验: {info.get('exp_name', 'unknown')}",
+        f"GPU: {info.get('gpu', '?')}",
+    ]
+    if info.get('total'):
+        lines.append(f"Epoch: {info['current']}/{info['total']}")
+    else:
+        lines.append(f"Epoch: {info.get('current', '?')}")
+    if info.get('val_acc') is not None:
+        lines.append(f"Val Acc: {info['val_acc']*100:.1f}%")
+    if info.get('val_mf1') is not None:
+        lines.append(f"Val MF1: {info['val_mf1']*100:.1f}%")
+    if info.get('val_loss') is not None:
+        lines.append(f"Val Loss: {info['val_loss']:.4f}")
+    if fmt == "detailed":
+        if info.get('desc'):
+            lines.append(f"描述: {info['desc']}")
+        if notify_type == "alert" and info.get('alert_reason'):
+            lines.append(f"原因: {info['alert_reason']}")
+    return '\n'.join(lines)
+
+
+def format_multi_notification(processes_info, notify_type="report", fmt="detailed"):
+    """格式化多训练进程通知"""
+    type_labels = {"report": "训练状态汇报", "complete": "训练完成通知"}
+    title = type_labels.get(notify_type, "训练通知")
+    lines = ["══════════════════════════════", title, "══════════════════════════════"]
+    for info in processes_info:
+        gpu = info.get('gpu', '?')
+        exp = info.get('exp_name', 'unknown')
+        epoch = f"{info['current']}/{info['total']}" if info.get('total') else str(info.get('current', '?'))
+        if info.get('val_acc') is not None:
+            metric = f"Acc {info['val_acc']*100:.1f}%"
+        elif info.get('val_loss') is not None:
+            metric = f"loss {info['val_loss']:.3f}"
+        else:
+            metric = "-"
+        lines.append(f"  GPU {gpu}: {exp:<15} Epoch {epoch:<8} {metric}")
+    return '\n'.join(lines)
+
+
+def send_dingtalk(webhook, message, retries=3):
+    """发送钉钉通知，带重试"""
+    if not webhook:
+        return False, "webhook未配置"
+    data = json.dumps({"msgtype": "text", "text": {"content": message}}).encode('utf-8')
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(webhook, data=data, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+                if result.get('errcode') == 0:
+                    return True, "发送成功"
+                msg = result.get('errmsg', '未知错误')
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return False, f"API错误: {msg}"
+        except urllib.error.URLError as e:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            return False, f"网络错误: {e}"
+        except Exception as e:
+            return False, f"发送失败: {e}"
+    return False, "重试次数用尽"
+
+
+def test_config(config):
+    """测试配置"""
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║                    配置验证报告                              ║")
+    print("╠══════════════════════════════════════════════════════════════╣")
+    checks = []
+    if CONFIG_FILE.exists():
+        checks.append(("✓", "配置文件存在"))
+    else:
+        checks.append(("✗", "配置文件不存在，请运行 trainbot setup"))
+    webhook = get_webhook(config)
+    if webhook:
+        if webhook.startswith("https://oapi.dingtalk.com/"):
+            checks.append(("✓", "webhook格式正确"))
+            ok, msg = send_dingtalk(webhook, f"trainbot 配置测试 v{VERSION}")
+            checks.append(("✓" if ok else "✗", f"webhook连接: {msg}"))
+        else:
+            checks.append(("✗", "webhook格式不正确"))
+    else:
+        checks.append(("✗", "webhook未配置"))
+    checks.append(("✓", f"监控模式: {config.get('monitor', {}).get('mode', 'auto')}"))
+    checks.append(("✓", f"异常检测: {'开启' if config.get('alert') else '关闭'}"))
+    for status, msg in checks:
+        print(f"║  {status} {msg:<57}║")
+    print("╚══════════════════════════════════════════════════════════════╝")
+
+
+# === Notification History ===
+
+
+def record_history(notify_type, info, success=True):
+    """记录通知历史"""
+    ensure_config_dir()
+    history = load_history()
+    history.insert(0, {
+        "time": now_beijing().isoformat(),
+        "type": notify_type,
+        "experiment": info.get('exp_name', 'unknown'),
+        "gpu": info.get('gpu', '?'),
+        "epoch": f"{info.get('current', '?')}/{info.get('total', '?')}" if info.get('total') else str(info.get('current', '?')),
+        "val_acc": f"{info['val_acc']*100:.1f}%" if info.get('val_acc') is not None else None,
+        "success": success,
+    })
+    history = history[:100]
+    with open(HISTORY_FILE, 'w') as f:
+        json.dump({"notifications": history}, f, indent=2, ensure_ascii=False)
+
+
+def load_history():
+    """加载通知历史"""
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, 'r') as f:
+                return json.load(f).get("notifications", [])
+        except Exception:
+            pass
+    return []
+
+
+def show_history(show_all=False, clear=False):
+    """显示通知历史"""
+    if clear:
+        HISTORY_FILE.unlink(missing_ok=True)
+        print("✓ 通知历史已清空")
+        return
+    history = load_history()
+    if not history:
+        print("暂无通知历史")
+        return
+    if not show_all:
+        history = history[:10]
+    print("══════════════════════════════════════════════════════════════")
+    print("  通知历史")
+    print("══════════════════════════════════════════════════════════════")
+    print(f"  {'时间':<20} {'类型':<10} {'实验':<15} {'GPU':<8} {'状态':<6}")
+    print(f"  {'─'*20} {'─'*10} {'─'*15} {'─'*8} {'─'*6}")
+    for h in history:
+        t = h.get('time', '?')[:19]
+        typ = h.get('type', '?')
+        exp = h.get('experiment', '?')[:15]
+        gpu = h.get('gpu', '?')
+        status = "✓" if h.get('success') else "✗"
+        print(f"  {t:<20} {typ:<10} {exp:<15} {gpu:<8} {status:<6}")
+    if not show_all and len(load_history()) > 10:
+        print(f"\n  显示最近10条，使用 --history --all 查看全部")
+    print()
+
+
+# === Manual Notification ===
+
+
+def send_manual_notify(config, notify_all=False):
+    """手动发送通知"""
+    webhook = get_webhook(config, "default")
+    if not webhook:
+        print("✗ 请先运行 trainbot setup 配置webhook")
+        return
+    processes = get_gpu_processes()
+    if not processes:
+        print("没有发现正在运行的训练进程")
+        return
+    processes_info = []
+    for p in processes:
+        info = parse_training_log(p['log_path']) if p['log_path'] else {}
+        if info:
+            info['exp_name'] = p['exp_name']
+            info['gpu'] = p['gpu']
+            processes_info.append(info)
+    if not processes_info:
+        print("无法解析训练日志")
+        return
+    if notify_all:
+        msg = format_multi_notification(processes_info, "report", config.get("format", "detailed"))
+    else:
+        msg = format_notification(processes_info[0], "complete", config.get("format", "detailed"))
+    ok, result = send_dingtalk(webhook, msg)
+    print(f"{'✓' if ok else '✗'} {result}")
+    record_history("manual", processes_info[0] if processes_info else {}, success=ok)
+
+
+# === Daemon Mode ===
+
+
+def load_notified_pids():
+    if NOTIFIED_FILE.exists():
+        try:
+            with open(NOTIFIED_FILE, 'r') as f:
+                return set(json.load(f).get("notified_pids", []))
+        except Exception:
+            pass
+    return set()
+
+
+def save_notified_pids(pids):
+    ensure_config_dir()
+    with open(NOTIFIED_FILE, 'w') as f:
+        json.dump({"notified_pids": list(pids), "last_update": now_beijing().isoformat()}, f, indent=2)
+
+
+def is_daemon_running():
+    if not PID_FILE.exists():
+        return False
+    try:
+        with open(PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError, PermissionError):
+        PID_FILE.unlink(missing_ok=True)
+        return False
+
+
+def stop_daemon():
+    if not PID_FILE.exists():
+        print("后台监控未运行")
+        return
+    try:
+        with open(PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGTERM)
+        print(f"✓ 已停止后台监控 (PID: {pid})")
+    except ProcessLookupError:
+        print("后台监控进程已不存在")
+    except Exception as e:
+        print(f"停止失败: {e}")
+    finally:
+        PID_FILE.unlink(missing_ok=True)
+
+
+def start_daemon(config):
+    """启动后台监控"""
+    if is_daemon_running():
+        print("后台监控已在运行")
+        return
+    ensure_config_dir()
+    with open(PID_FILE, 'w') as f:
+        f.write(str(os.getpid()))
+    log_message("后台监控启动")
+    print(f"✓ 后台监控已启动 (PID: {os.getpid()})")
+
+    loss_history = {}
+    acc_history = {}
+    last_report_time = 0
+    notified_pids = load_notified_pids()
+
+    try:
+        while True:
+            try:
+                processes = get_gpu_processes()
+                for p in processes:
+                    pid = p['pid']
+                    if p['log_path']:
+                        info = parse_training_log(p['log_path'])
+                        if info:
+                            info['exp_name'] = p['exp_name']
+                            info['gpu'] = p['gpu']
+                            if pid not in loss_history:
+                                loss_history[pid] = []
+                                acc_history[pid] = []
+                            if info.get('val_loss') is not None:
+                                loss_history[pid].append(info['val_loss'])
+                            if info.get('val_acc') is not None:
+                                acc_history[pid].append(info['val_acc'])
+                            # Anomaly detection
+                            alerts = []
+                            if config.get("alert", True):
+                                thresholds = config.get("alert_thresholds", {})
+                                if info.get('val_loss') is not None:
+                                    r = check_anomaly(loss_history[pid], config=config)
+                                    if r[0]:
+                                        alerts.append(f"Loss突增: {r[1]:.2f}x")
+                                if info.get('val_acc') is not None:
+                                    r = check_acc_anomaly(acc_history[pid], config=config)
+                                    if r[0]:
+                                        alerts.append(f"Acc下降: {r[1]:.4f}")
+                            for alert_msg in alerts:
+                                info['alert_reason'] = alert_msg
+                                webhook = get_webhook(config, "alert")
+                                msg = format_notification(info, "alert", config.get("format", "detailed"))
+                                ok, _ = send_dingtalk(webhook, msg)
+                                record_history("alert", info, success=ok)
+                                log_message(f"告警: {alert_msg}")
+                            # Completion detection
+                            if info.get('total') and info['current'] >= info['total']:
+                                if pid not in notified_pids:
+                                    webhook = get_webhook(config, "complete")
+                                    msg = format_notification(info, "complete", config.get("format", "detailed"))
+                                    ok, _ = send_dingtalk(webhook, msg)
+                                    if ok:
+                                        notified_pids.add(pid)
+                                        save_notified_pids(notified_pids)
+                                    record_history("complete", info, success=ok)
+                                    log_message(f"训练完成: {info['exp_name']}")
+                # Periodic report
+                interval = config.get("interval_hours", 0)
+                if interval > 0 and time.time() - last_report_time >= interval * 3600:
+                    if processes:
+                        infos = []
+                        for p in processes:
+                            info = parse_training_log(p['log_path']) if p['log_path'] else {}
+                            if info:
+                                info['exp_name'] = p['exp_name']
+                                info['gpu'] = p['gpu']
+                                infos.append(info)
+                        if infos:
+                            webhook = get_webhook(config, "report")
+                            msg = format_multi_notification(infos, "report", config.get("format", "detailed"))
+                            send_dingtalk(webhook, msg)
+                            last_report_time = time.time()
+            except Exception as e:
+                log_message(f"监控周期异常: {e}", "ERROR")
+            if not is_daemon_running():
+                break
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log_message("后台监控被中断")
+    finally:
+        stop_daemon()
+
+
 # === Status Display ===
 
 
@@ -756,7 +1098,7 @@ def show_status(config=None):
 
 
 def print_help():
-    """打印帮助信息"""
+    """显示帮助信息"""
     print(f"trainbot v{VERSION} - GPU训练监控+钉钉告警工具")
     print()
     print("用法:")
@@ -764,11 +1106,26 @@ def print_help():
     print("  trainbot status       同上")
     print("  trainbot setup        交互式配置向导")
     print("  trainbot config       查看当前配置")
+    print("  trainbot test         测试配置（发送测试通知）")
+    print()
+    print("通知:")
+    print("  trainbot notify       手动发通知")
+    print("  trainbot notify-all   发送所有训练状态")
+    print()
+    print("监控:")
+    print("  trainbot daemon       启动后台监控")
+    print("  trainbot daemon stop  停止后台监控")
+    print("  trainbot daemon status 查看后台监控状态")
+    print()
+    print("历史:")
+    print("  trainbot history      查看最近10条通知")
+    print("  trainbot history --all    查看全部")
+    print("  trainbot history --clear  清空历史")
+    print()
     print("  trainbot --help       显示此帮助信息")
     print("  trainbot --version    显示版本号")
     print()
     print("配置文件: ~/.trainbot/config.json")
-    print()
 
 
 def main():
@@ -786,8 +1143,31 @@ def main():
     elif args[0] == "config":
         config = load_config()
         print_config(config)
+    elif args[0] == "test":
+        config = load_config()
+        test_config(config)
+    elif args[0] == "notify":
+        config = load_config()
+        send_manual_notify(config)
+    elif args[0] == "notify-all":
+        config = load_config()
+        send_manual_notify(config, notify_all=True)
     elif args[0] == "daemon":
-        print("  daemon 模式尚未实现（将在后续版本中添加）")
+        config = load_config()
+        if len(args) > 1 and args[1] == "stop":
+            stop_daemon()
+        elif len(args) > 1 and args[1] == "status":
+            if is_daemon_running():
+                with open(PID_FILE, 'r') as f:
+                    print(f"✓ 后台监控运行中 (PID: {f.read().strip()})")
+            else:
+                print("后台监控未运行")
+        else:
+            start_daemon(config)
+    elif args[0] == "history":
+        show_all = "--all" in args
+        clear = "--clear" in args
+        show_history(show_all=show_all, clear=clear)
     else:
         print(f"  未知命令: {args[0]}")
         print_help()
