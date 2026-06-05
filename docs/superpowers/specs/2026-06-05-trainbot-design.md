@@ -118,9 +118,25 @@ trainbot/
     "loss_spike": 2.0,
     "acc_drop": 0.2,
     "check_nan": true
+  },
+  "monitor": {
+    "mode": "auto",
+    "log_dir": null,
+    "custom_patterns": null,
+    "tensorboard_dir": null
   }
 }
 ```
+
+**配置说明：**
+- `monitor.mode`: 监控模式
+  - `auto`: 自动发现（默认）
+  - `log_dir`: 监控指定目录
+  - `tensorboard`: 读取TensorBoard日志
+  - `custom`: 使用自定义正则
+- `monitor.log_dir`: 日志目录路径（mode=log_dir时必填）
+- `monitor.custom_patterns`: 自定义正则表达式（mode=custom时必填）
+- `monitor.tensorboard_dir`: TensorBoard日志目录（mode=tensorboard时必填）
 
 ### 3.3 钉钉机器人API
 
@@ -139,7 +155,64 @@ data = {
 requests.post(webhook, json=data)
 ```
 
-### 3.4 异常检测算法
+### 3.4 监控方式
+
+**支持多种数据源：**
+
+| 数据源 | 描述 | 优先级 |
+|--------|------|--------|
+| stdout日志 | 从/proc/pid/fd/1读取进程输出 | P0 |
+| 日志文件 | 监控指定目录的日志文件 | P0 |
+| TensorBoard | 读取events.out.tfevents文件 | P1 |
+| wandb | 通过wandb API获取运行状态 | P1 |
+| 自定义正则 | 用户配置正则表达式匹配 | P1 |
+
+**支持的日志格式（内置）：**
+
+```python
+# 格式1: PyTorch Lightning / 自定义
+r'Epoch\s+(\d+)/(\d+).*?Val\s+[\d.]+\s+([\d.]+)\s+([\d.]+)'
+
+# 格式2: HuggingFace Trainer
+r'Epoch\s+(\d+).*?loss[:\s]+([\d.]+).*?accuracy[:\s]+([\d.]+)'
+
+# 格式3: 融合实验格式
+r'Ep\s+(\d+).*?Val Loss\s+[\d.]+\s+Acc\s+([\d.]+).*?MF1\s+([\d.]+)'
+
+# 格式4: 简单loss格式
+r'Epoch\s+(\d+)/(\d+).*?loss[:\s]+([\d.]+)'
+
+# 格式5: Keras格式
+r'Epoch\s+(\d+)/(\d+).*?val_accuracy[:\s]+([\d.]+)'
+
+# 格式6: 自定义print格式
+r'\[(\d+)/(\d+)\].*?val_loss[:\s]+([\d.]+).*?val_acc[:\s]+([\d.]+)'
+```
+
+**自定义正则配置：**
+```json
+{
+  "custom_patterns": {
+    "epoch": "Epoch\\s+(\\d+)/(\\d+)",
+    "loss": "loss[:\\s]+([\\d.]+)",
+    "acc": "accuracy[:\\s]+([\\d.]+)",
+    "mf1": "MF1[:\\s]+([\\d.]+)"
+  }
+}
+```
+
+**TensorBoard支持：**
+```python
+from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+ea = EventAccumulator(log_dir)
+ea.Reload()
+# 获取最新scalar
+loss = ea.Scalars('loss')[-1].value
+acc = ea.Scalars('accuracy')[-1].value
+```
+
+### 3.5 异常检测算法
 
 **Loss飙升检测：**
 ```python
@@ -206,6 +279,12 @@ trainbot --setup
 # ? 选择通知格式 (1-简洁 2-详细): 2
 # ? 是否开启异常检测 (y/n): y
 # ? 定时汇报间隔 (小时，0为关闭): 0
+# ? 选择监控模式:
+#   1. 自动发现（默认，推荐）
+#   2. 监控指定目录
+#   3. 读取TensorBoard日志
+#   4. 自定义正则表达式
+# > 1
 # ✓ 配置已保存到 ~/.trainbot/config.json
 
 # 3. 测试
@@ -251,6 +330,10 @@ train-monitor/
 - 添加`--notify`手动通知
 - 添加训练完成自动通知
 - 添加异常检测（loss/acc/NaN）
+- 支持多种日志格式（6种内置格式）
+- 支持自定义正则表达式
+- 支持监控指定目录
+- 支持TensorBoard日志读取
 
 **v0.2:**
 - 添加`--daemon`后台监控
@@ -269,10 +352,13 @@ train-monitor/
 | 轻量级CLI | ✓ | ✗ | ✗ | ✗ |
 | 钉钉通知 | ✓ | ✗ | ✗ | ✗ |
 | 异常检测 | ✓ | ✓ | ✗ | ✓ |
+| 多日志格式 | ✓ | ✗ | ✗ | ✗ |
+| 自定义正则 | ✓ | ✗ | ✗ | ✗ |
+| TensorBoard支持 | ✓ | ✗ | ✓ | ✓ |
 | 免费 | ✓ | ✓ | ✓ | ✓ |
 | 本地运行 | ✓ | ✗ | ✓ | ✓ |
 
-**差异化优势：** trainbot是唯一一个"无需改代码+钉钉通知"的训练监控工具。
+**差异化优势：** trainbot是唯一一个"无需改代码+多格式支持+钉钉通知"的训练监控工具。
 
 ## 8. 风险与挑战
 
